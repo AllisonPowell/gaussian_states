@@ -302,7 +302,6 @@ entropylist=[]
 entropy_distlist=[]
 for a in range(3,int(1/2*M)):
     if a%2==0:
-        print(a)
         corr,entropy=chain(a,M)
         corrlist.append(corr)
         entropylist.append(entropy)
