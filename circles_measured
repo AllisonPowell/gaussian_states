@@ -1,0 +1,339 @@
+import numpy as np
+import scipy.linalg as la
+import matplotlib.pyplot as plt
+
+###############################################################################
+#  1) Build K: A multi-layer radial-lattice potential matrix
+###############################################################################
+
+def build_coupled_layers(num_layers, layer_sizes, k_ring=1.0, k_radial=1.0, k_tilde=2.0):
+    """
+    Construct an N x N real-symmetric matrix K for a system of 'num_layers'
+    concentric rings, with layer_sizes[i] = number of sites in layer i.
+    We sum layer_sizes = N total oscillators.
+
+    Couplings:
+      - ring coupling k_ring around each ring i
+      - radial coupling k_radial between ring i and i+1 (some simple mapping)
+      - on-site potential k_tilde on diagonal
+    """
+    if len(layer_sizes) != num_layers:
+        raise ValueError("layer_sizes must have length num_layers.")
+
+    N = sum(layer_sizes)
+    K = np.zeros((N, N))
+
+    layer_start = []
+    start = 0
+    for i in range(num_layers):
+        layer_start.append(start)
+        start += layer_sizes[i]
+
+    def global_index(i_layer, j_local):
+        return layer_start[i_layer] + j_local
+
+    # On-site
+    for i in range(N):
+        K[i,i] += k_tilde
+
+    # ring couplings
+    for i_layer in range(num_layers):
+        L = layer_sizes[i_layer]
+        for j in range(L):
+            g1 = global_index(i_layer, j)
+            # neighbor j+1 mod L
+            j2 = (j+1)%L
+            g2 = global_index(i_layer, j2)
+            K[g1, g2] += -k_ring
+            K[g2, g1] += -k_ring
+            K[g1, g1] += k_ring
+            K[g2, g2] += k_ring
+
+    # radial couplings
+    for i_layer in range(num_layers-1):
+        L1 = layer_sizes[i_layer]
+        L2 = layer_sizes[i_layer+1]
+        for j in range(L1):
+            g1 = global_index(i_layer, j)
+            # map j -> j2 in layer i+1
+            j2 = int(round(j * L2 / L1)) % L2
+            g2 = global_index(i_layer+1, j2)
+            K[g1, g2] += -k_radial
+            K[g2, g1] += -k_radial
+            K[g1, g1] += k_radial
+            K[g2, g2] += k_radial
+
+    return K
+
+###############################################################################
+#  2) Standard ground-state covariance building
+###############################################################################
+
+def ground_state_covariances(K, mu=1.0, hbar=1.0):
+    eigvals, U = la.eigh(K)
+    freqs = np.sqrt(eigvals / mu)
+
+    N = len(K)
+    Gamma_q = np.zeros((N, N))
+    Gamma_p = np.zeros((N, N))
+    for i in range(N):
+        omega = freqs[i]
+        x2 = hbar/(2*mu*omega)
+        p2 = hbar*mu*omega/2
+        ui = U[:, i]
+        Gamma_q += x2*np.outer(ui, ui)
+        Gamma_p += p2*np.outer(ui, ui)
+    return Gamma_q, Gamma_p
+
+def build_full_covariance(Gamma_q, Gamma_p):
+    N = Gamma_q.shape[0]
+    Gamma = np.zeros((2*N,2*N))
+    Gamma[:N,:N] = Gamma_q
+    Gamma[N:,N:] = Gamma_p
+    return Gamma
+
+###############################################################################
+#  3) Gaussian finite-resolution momentum measurement (bulk)
+###############################################################################
+
+def post_measurement_momentum_gaussian(Gamma, measure_sites, sigma_p):
+    """
+    measure_sites => indices of the oscillator to measure in momentum
+    sigma_p => measurement variance
+    """
+    N2 = Gamma.shape[0]
+    N = N2//2
+    # momentum dofs => site + N
+    M = [m + N for m in measure_sites]
+    M = np.array(M, dtype=int)
+
+    full_idx = np.arange(N2)
+    U = np.setdiff1d(full_idx, M)  # unmeasured dofs
+
+    Gamma_UU = Gamma[np.ix_(U,U)]
+    Gamma_MM = Gamma[np.ix_(M,M)]
+    Gamma_UM = Gamma[np.ix_(U,M)]
+    Gamma_MU = Gamma[np.ix_(M,U)]
+
+    R = len(M)
+    Sigma = sigma_p**2 * np.eye(R)
+
+    inv_part = la.inv(Gamma_MM + Sigma)
+    Gamma_U_post = Gamma_UU - Gamma_UM @ inv_part @ Gamma_MU
+    return U, Gamma_U_post
+
+###############################################################################
+#  4) Position correlation & partial entropy
+###############################################################################
+
+def position_correlation_sub(GammaU, U, i, j):
+    idx_i = np.where(U == i)[0]
+    idx_j = np.where(U == j)[0]
+    if len(idx_i)==0 or len(idx_j)==0:
+        return 0.0
+    return GammaU[idx_i[0], idx_j[0]]
+
+def compute_von_neumann_entropy_sub(GammaU):
+    dimU = GammaU.shape[0]
+    if dimU % 2 !=0:
+        raise ValueError(f"Cov dimension {dimU} not even.")
+    r = dimU//2
+    Omega = np.block([
+        [np.zeros((r,r)), np.eye(r)],
+        [-np.eye(r), np.zeros((r,r))]
+    ])
+    M = -Omega @ GammaU
+    w,_ = la.eig(M)
+    imag_vals = np.sort(np.abs(w.imag))
+    nu = imag_vals[r:]
+    def f(x):
+        if x<0.5:
+            x_eff = 0.5
+        else:
+            x_eff = x
+        plus = x_eff+0.5
+        minus= x_eff-0.5
+        return plus*np.log2(plus) - minus*np.log2(minus)
+    return sum(f(x) for x in nu)
+
+###############################################################################
+#  5) Concentric geometry + visualization
+###############################################################################
+
+def arrange_multi_layers(num_layers, layer_sizes, r0=1.0, dr=1.0):
+    if len(layer_sizes) != num_layers:
+        raise ValueError("layer_sizes must have length num_layers")
+    coords_x, coords_y = [], []
+    start=0
+    for i_layer in range(num_layers):
+        radius = r0 + i_layer*dr
+        L = layer_sizes[i_layer]
+        for j in range(L):
+            theta = 2*np.pi*j/L
+            x = radius*np.cos(theta)
+            y = radius*np.sin(theta)
+            coords_x.append(x)
+            coords_y.append(y)
+    return np.array(coords_x), np.array(coords_y)
+
+def visualize_concentric_layers(coords_x, coords_y,
+                               layers, boundary_layer_idx,
+                               corr_sites, entropy_sites,
+                               measure_sites):
+    """
+    color scheme:
+      - measure_sites => red (since these are the 'bulk' that we measure in momentum)
+      - boundary => we do that in a different color, say blue
+      - correlation => green
+      - entropy => orange
+    We label each site with index.
+    Priority: correlation>entropy>measure>boundary
+    """
+    N = len(coords_x)
+    plt.figure(figsize=(6,6))
+    plt.title("Concentric Multi-Layer (Bulk-Measured)")
+
+    color = ['red']*N  # default boundary color
+    # the boundary layer is layers[boundary_layer_idx]
+    # the 'bulk' is everything else => measure_sites is some subset of that
+
+    boundary_sites = layers[boundary_layer_idx]
+    boundary_set = set(boundary_sites)
+
+    # everything not in boundary => potential bulk => but the user might measure only some
+    measure_set = set(measure_sites)
+    corr_set = set(corr_sites)
+    ent_set = set(entropy_sites)
+
+    # let's mark measure => red
+    for m in measure_set:
+        color[m] = 'blue'
+    # mark correlation => green
+    for c in corr_set:
+        color[c] = 'green'
+    # mark entropy => orange
+    for e in ent_set:
+        color[e] = 'orange'
+    # boundary is left as default 'blue' except if overridden
+
+    # plot
+    for i in range(N):
+        plt.plot(coords_x[i], coords_y[i], 'o', color=color[i], markersize=10)
+        plt.text(coords_x[i]*1.03, coords_y[i]*1.03, f"{i}",
+                 ha='center', va='bottom', fontsize=8)
+
+    plt.axis('equal')
+    plt.show()
+
+###############################################################################
+#  6) Main script: measure the *bulk* and keep the boundary unmeasured
+###############################################################################
+
+def example_run_concentric_measure_bulk():
+    num_layers = 7
+    layer_sizes = [6*i for i in range(1, num_layers+1)]  # e.g. [6,12,18]
+    N = sum(layer_sizes)
+    print(f"Total sites = {N}, layer_sizes = {layer_sizes}")
+
+    # Build potential
+    k_ring=1.0
+    k_radial=1.0
+    k_tilde=2.0
+    K = build_coupled_layers(num_layers, layer_sizes, k_ring, k_radial, k_tilde)
+    # ground-state
+    Gq, Gp = ground_state_covariances(K)
+    Gamma_full = build_full_covariance(Gq, Gp)
+
+    # define layers
+    layers = []
+    start=0
+    for i in range(num_layers):
+        L=layer_sizes[i]
+        layer_inds = list(range(start,start+L))
+        layers.append(layer_inds)
+        start+=L
+
+    boundary_layer_idx = num_layers-1
+    boundary_sites = layers[boundary_layer_idx]
+
+    # the rest is 'bulk'
+    bulk_sites = []
+    for i_layer in range(num_layers-1):
+        bulk_sites.extend(layers[i_layer])
+
+    # measure the *bulk* in momentum
+    measure_sites = bulk_sites
+    sigma_p=0.2
+
+    # do measurement
+    U, Gamma_post = post_measurement_momentum_gaussian(Gamma_full, measure_sites, sigma_p)
+
+    # pick correlation, entropy sites among the boundary
+    # e.g. last 2 => correlation, first 2 => entropy
+    if len(boundary_sites)>=4:
+        corr_pair = boundary_sites[-2:]
+        ent_sites = boundary_sites[:5]
+    else:
+        corr_pair = boundary_sites[:2]
+        ent_sites = boundary_sites[:2]
+
+    # compute correlation
+    if len(corr_pair)>=2:
+        i_corr,j_corr = corr_pair[0], corr_pair[1]
+        xcorr = position_correlation_sub(Gamma_post, U, i_corr, j_corr)
+        print(f"Post-measurement correlation <x_{i_corr} x_{j_corr}> = {xcorr:.4f}")
+    else:
+        print("Not enough boundary sites for correlation pair")
+
+    # compute partial entropy
+    subGamma = sub_extract_sites(U, Gamma_post, ent_sites)
+    if subGamma is not None:
+        try:
+            S_vN= compute_von_neumann_entropy_sub(subGamma)
+            print(f"Entropy of boundary sites {ent_sites} => {S_vN:.4f} bits")
+        except ValueError as e:
+            print("Entropy calculation error:", e)
+
+    # visualize
+    coords_x, coords_y = arrange_multi_layers(num_layers, layer_sizes, r0=1.0, dr=1.0)
+
+    visualize_concentric_layers(coords_x, coords_y,
+                               layers, boundary_layer_idx,
+                               corr_pair, ent_sites,
+                               measure_sites)
+
+def sub_extract_sites(U, GammaU, site_list):
+    """
+    Extract 2R x 2R sub-cov for site_list from leftover dofs U, 
+    each site => (q_i, p_i). We'll do the same approach as earlier:
+    find i, i+N in U -> gather them in order -> sub-block.
+    """
+    maxU= max(U)
+    original_N = (maxU+1)//2
+    sub_dofs = []
+    for i in site_list:
+        if i>= original_N:
+            return None
+        p_idx= i+original_N
+        if i not in U or p_idx not in U:
+            print(f"Site {i} dof not in leftover => skip sub-cov.")
+            return None
+        sub_dofs.append(i)
+        sub_dofs.append(p_idx)
+
+    sub_dofs_arr = np.array(sub_dofs,dtype=int)
+    idx_list=[]
+    for d in sub_dofs_arr:
+        wh= np.where(U==d)[0]
+        if len(wh)==0:
+            return None
+        idx_list.append(wh[0])
+    idx_list = np.array(idx_list,dtype=int)
+    subGamma= GammaU[np.ix_(idx_list, idx_list)]
+    return subGamma
+
+def run_main():
+    example_run_concentric_measure_bulk()
+
+if __name__=="__main__":
+    run_main()
