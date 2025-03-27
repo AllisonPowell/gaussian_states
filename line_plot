@@ -1,0 +1,331 @@
+import numpy as np
+import scipy.linalg as la
+import matplotlib.pyplot as plt
+
+###############################################################################
+#  1) Build a 1D harmonic chain Hamiltonian and ground-state covariance
+###############################################################################
+
+def build_harmonic_chain(N, k, k_tilde):
+    """
+    Build the NxN matrix K encoding the potential energy
+    for a 1D chain of N oscillators with nearest-neighbor coupling k
+    and on-site potential k_tilde:
+    
+      H = sum_r [p_r^2/(2 mu)] + (1/2) q^T K q
+    
+    We'll assume open boundary conditions for simplicity.
+    """
+    K = np.zeros((N, N))
+    for i in range(N):
+        K[i,i] = k_tilde + 2*k
+        if i < N-1:
+            K[i,i+1] = -k
+            K[i+1,i] = -k
+    return K
+
+def ground_state_covariances(K, mu=1.0, hbar=1.0):
+    """
+    Given the NxN potential matrix K, compute the NxN submatrices
+    Gamma_q, Gamma_p for positions and momenta in the ground state.
+    """
+    eigvals, U = la.eigh(K)
+    freqs = np.sqrt(eigvals / mu)
+    N = len(K)
+
+    Gamma_q = np.zeros((N, N), dtype=float)
+    Gamma_p = np.zeros((N, N), dtype=float)
+
+    # For mode i: <x_i^2> = hbar/(2*mu*omega), <p_i^2> = hbar*mu*omega/2
+    for i in range(N):
+        omega = freqs[i]
+        x2 = hbar/(2*mu*omega)
+        p2 = hbar*mu*omega/2
+        ui = U[:, i]
+        Gamma_q += x2*np.outer(ui, ui)
+        Gamma_p += p2*np.outer(ui, ui)
+
+    return Gamma_q, Gamma_p
+
+def build_full_covariance(Gamma_q, Gamma_p):
+    """
+    Construct the 2N x 2N full covariance matrix:
+        Gamma = [[Gamma_q,   0],
+                 [   0,    Gamma_p]]
+    """
+    N = Gamma_q.shape[0]
+    Gamma = np.zeros((2*N, 2*N))
+    Gamma[:N, :N] = Gamma_q
+    Gamma[N:, N:] = Gamma_p
+    return Gamma
+
+###############################################################################
+#  2) Gaussian finite-resolution measurement of momentum with variance sigma_p^2
+###############################################################################
+
+def post_measurement_momentum_gaussian(Gamma, measure_sites, sigma_p):
+    """
+    Model a Gaussian measurement of the momentum quadratures
+    for the chosen 'measure_sites' with variance sigma_p^2.
+    This ensures the leftover (unmeasured) degrees of freedom remain Gaussian
+    with physical symplectic eigenvalues >= 0.5.
+
+    Steps:
+      1) Identify M = momentum indices {r + N for r in measure_sites} in [N..2N-1].
+      2) Let U = the complement dofs in [0..2N-1].
+      3) The measurement covariance Sigma = sigma_p^2 I_{|M|} is added to Gamma_{MM}.
+      4) new covariance for dofs U is:
+            Gamma'_U = Gamma_{UU} - Gamma_{UM} (Gamma_{MM} + Sigma)^{-1} Gamma_{MU}
+      5) Return (U, Gamma'_U).
+    """
+    N2 = Gamma.shape[0]  # = 2N
+    N = N2 // 2
+
+    # The set of momentum indices we measure:
+    M = [m + N for m in measure_sites]  # shift by N for p-coords
+    M = np.array(M, dtype=int)
+
+    # The unmeasured dofs:
+    full_indices = np.arange(N2, dtype=int)
+    U = np.setdiff1d(full_indices, M)
+
+    # Partition the big matrix
+    Gamma_UU = Gamma[np.ix_(U, U)]
+    Gamma_MM = Gamma[np.ix_(M, M)]
+    Gamma_UM = Gamma[np.ix_(U, M)]
+    Gamma_MU = Gamma[np.ix_(M, U)]
+
+    # Add Sigma = sigma_p^2 * I_{|M|}
+    R = len(M)
+    Sigma = sigma_p**2 * np.eye(R)
+
+    # Schur complement
+    inv_part = la.inv(Gamma_MM + Sigma)
+    Gamma_U_post = Gamma_UU - Gamma_UM @ inv_part @ Gamma_MU
+
+    return U, Gamma_U_post
+
+###############################################################################
+#  3) Utility functions to compute correlation or entropy on the leftover dofs
+###############################################################################
+
+def position_correlation_sub(GammaU, U, i, j):
+    """
+    Return <x_i x_j> from the sub-covariance GammaU (dimU x dimU),
+    where U is the list/array of unmeasured dofs (global indices).
+    i,j must be in U and i,j < N to refer to position dofs.
+    """
+    idx_i = np.where(U == i)[0]
+    idx_j = np.where(U == j)[0]
+    if len(idx_i)==0 or len(idx_j)==0:
+        print(f"Warning: i={i} or j={j} not in unmeasured set => correlation=0")
+        return 0.0
+    return GammaU[idx_i[0], idx_j[0]]
+
+def compute_von_neumann_entropy_sub(GammaU):
+    """
+    Standard formula for Gaussian states. Must have even dimension=2r.
+    """
+    dimU = GammaU.shape[0]
+    if dimU % 2 != 0:
+        raise ValueError(f"Cov dimension not even: {dimU}")
+
+    r = dimU // 2
+    Omega = np.block([
+        [np.zeros((r, r)), np.eye(r)],
+        [-np.eye(r),       np.zeros((r, r))]
+    ])
+    M = -Omega @ GammaU
+    w, _ = la.eig(M)
+    imag_vals = np.abs(w.imag)
+    imag_vals.sort()
+    nu = imag_vals[r:]  # largest r
+    #print("nu=",nu)
+
+    def f(x):
+        if x < 0.5:
+            x_eff = 0.500001  # clamp or raise error
+        else:
+            x_eff = x
+        plus = x_eff + 0.5
+        minus = x_eff - 0.5
+        return plus * np.log2(plus) - minus * np.log2(minus)
+
+    S = sum(f(val) for val in nu)
+    return S
+
+###############################################################################
+#  4) Visualization of a 1D chain with color-coded sites
+###############################################################################
+
+def visualize_chain_1d(N,
+                       measure_sites=None,
+                       unmeasured=None,
+                       calc_sites=None,
+                       corr_sites=None):
+    """
+    Show the 1D chain on a horizontal line:
+      - measure_sites => red
+      - unmeasured => blue
+      - calc_sites => orange
+      - corr_sites => green
+
+    We label each site i at x=i, y=0 with a small offset text.
+    If a site belongs to multiple categories, we'll define a priority:
+      corr_sites => green
+      calc_sites => orange
+      measure_sites => red
+      unmeasured => blue
+    If there's overlap in sets, the priority is corr_sites > calc_sites > measure_sites > unmeasured.
+    """
+    xvals = np.arange(N)
+    # default color
+    color = ['blue'] * N  # boundary / unmeasured
+    marker = ['o'] * N
+
+    measure_set = set(measure_sites) if measure_sites else set()
+    calc_set = set(calc_sites) if calc_sites else set()
+    corr_set = set(corr_sites) if corr_sites else set()
+
+    # Overlap priority => corr > calc > measure > unmeasured
+
+    # Mark measure => red
+    for i in measure_set:
+        color[i] = 'red'
+
+    # Mark calc => orange
+    for i in calc_set:
+        color[i] = 'orange'
+
+    # Mark corr => green
+    for i in corr_set:
+        color[i] = 'green'
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(8,2))
+    plt.title("1D Chain Visualization")
+
+    for i in range(N):
+        plt.plot(xvals[i], 0, marker=marker[i], color=color[i],
+                 markersize=10, linestyle='None')
+        # label
+        plt.text(xvals[i], 0.05, f"{i}", ha='center', va='bottom', fontsize=8)
+
+    plt.ylim(-0.2, 0.3)
+    plt.xlim(-1, N)
+    plt.yticks([])
+    plt.show()
+
+###############################################################################
+#  5) Example demonstration
+###############################################################################
+
+"""
+def example_run_finite_resolution_measurement_visualized():
+
+
+    # We'll define 'unmeasured' as all the other sites
+    all_sites = set(range(N))
+    unmeasured_sites = list(all_sites - set(measure_sites))
+
+    # Maybe we choose calc_sites = [0,5] for some calculation
+    calc_sites = [0,3]
+
+    # Suppose we choose correlation sites = [3,4]
+    corr_sites = [0,3]
+
+    # Visualize the original chain
+    print("Visualizing the original chain (pre-measurement).")
+    # measure_sites => red, unmeasured => blue, calc => orange, corr => green
+    visualize_chain_1d(N,
+                       measure_sites=measure_sites,
+                       unmeasured=unmeasured_sites,
+                       calc_sites=calc_sites,
+                       corr_sites=corr_sites)
+
+    # Perform the measurement update
+    U, Gamma_post = post_measurement_momentum_gaussian(Gamma_full, measure_sites, sigma_p)
+
+    # Now let's see which dofs in real space remain
+    # U is a list of indices in [0..2N-1]. We want to see which q or p remain.
+    # but for a simpler 1D chain plot, we just know we have measured sites => red.
+    # The rest => some remain. For post-measurement correlation, let's say we check <x_0 x_5>.
+    corr_val = position_correlation_sub(Gamma_post, U, 0, 3)
+    print(f"<x_0 x_5> after Gaussian measurement (sigma_p={sigma_p}) => {corr_val:.4f}")
+
+    # Entropy of leftover
+    S_vN = compute_von_neumann_entropy_sub(Gamma_post)
+    print(f"Entropy of leftover dofs = {S_vN:.4f} bits")
+"""
+def chain(N,M):
+    k = 1.0
+    k_tilde = 2.0
+    mu = 1.0
+    hbar = 1.0
+
+    K = build_harmonic_chain(M, k, k_tilde)
+    Gq, Gp = ground_state_covariances(K, mu=mu, hbar=hbar)
+    Gamma_full = build_full_covariance(Gq, Gp)
+
+    # Suppose we measure momentum of sites [1,2] with finite resolution sigma_p=0.2
+ 
+    sigma_p = 0.2
+
+    
+    # 2) Define bulk, boundary
+    #measure_sites = [i for i in range(1,N-1)]
+    measure_sites = [i for i in range(int(M/4),int(M/4)+5+N-1)]
+    boundary_sites = [i for i in range(N) if i not in measure_sites]
+
+    #correlation_sites,entropy_sites=[0,N]
+    correlation_sites=[int(M/4)-1,int(M/4)+5+N]
+    entropy_sites=[int(M/4)-1,int(M/4)+5+N]
+
+
+    # Perform the measurement update
+    U, Gamma_post = post_measurement_momentum_gaussian(Gamma_full, measure_sites, sigma_p)
+
+    
+    corr_val = position_correlation_sub(Gamma_post, U, correlation_sites[0],correlation_sites[1])
+   
+
+    # Entropy of leftover
+    S_vN = compute_von_neumann_entropy_sub(Gamma_post) 
+    # 7) Print entropy for chosen "entropy sites"
+    # subGamma_entropy = extract_subregion_covariance(Gamma_full, entropy_sites)
+    return corr_val,S_vN
+
+M=400
+corrlist=[]
+corr_distlist=[]
+entropylist=[]
+entropy_distlist=[]
+for a in range(3,int(1/2*M)):
+    if a%2==0:
+        print(a)
+        corr,entropy=chain(a,M)
+        corrlist.append(corr)
+        entropylist.append(entropy)
+        corr_distlist.append(a)
+        entropy_distlist.append(a)
+
+
+
+plt.subplot(1, 2, 1)
+plt.plot(corr_distlist[1:],corrlist[1:],".")
+plt.yscale('log')
+plt.xlabel("Boundary Length")
+plt.ylabel("log(Correlation)")
+
+
+plt.subplot(1, 2, 2)
+plt.plot(entropy_distlist[1:],entropylist[1:],".")
+#plt.yscale('log')
+plt.xlabel("Boundary Length")
+plt.ylabel("Entropy")
+
+plt.tight_layout()
+
+plt.show()
+
+print("Finished")
