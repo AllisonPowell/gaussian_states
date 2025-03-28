@@ -4,6 +4,161 @@ import matplotlib.pyplot as plt
 import math
 
 ###############################################################################
+# 1) Build a single ring (no bulk)
+###############################################################################
+
+def build_ring_only(N, k_ring=1.0, k_tilde=2.0):
+    """
+    Build an N x N real-symmetric matrix K for a single ring of N sites.
+    Couplings:
+      - Nearest-neighbor ring edges => off-diag -k_ring
+      - On-site => +k_tilde on diagonal
+    The potential energy is (1/2) q^T K q,
+    so the total Hamiltonian is H = sum[p^2/(2mu)] + (1/2) q^T K q.
+    """
+    K = np.zeros((N, N))
+    # On-site potential
+    for i in range(N):
+        K[i, i] += k_tilde
+
+    # Ring coupling
+    for i in range(N):
+        j = (i + 1) % N
+        # Off-diagonal
+        K[i, j] += -k_ring
+        K[j, i] += -k_ring
+        # On the diagonal
+        K[i, i] += k_ring
+        K[j, j] += k_ring
+
+    return K
+
+def ground_state_covariances_ring(K, mu=1.0, hbar=1.0):
+    """
+    Given NxN matrix K, compute NxN submatrices Gamma_q, Gamma_p
+    for positions (Gamma_q) and momenta (Gamma_p) in the ground state.
+    """
+    eigvals, U = la.eigh(K)
+    freqs = np.sqrt(eigvals / mu)
+    N = len(K)
+
+    Gamma_q = np.zeros((N, N))
+    Gamma_p = np.zeros((N, N))
+    for i in range(N):
+        omega = freqs[i]
+        x2 = hbar / (2 * mu * omega)
+        p2 = hbar * mu * omega / 2
+
+        ui = U[:, i]
+        Gamma_q += x2 * np.outer(ui, ui)
+        Gamma_p += p2 * np.outer(ui, ui)
+    return Gamma_q, Gamma_p
+
+def build_full_covariance_ring(Gamma_q, Gamma_p):
+    """
+    2N x 2N block diagonal covariance:
+      [[Gamma_q,  0     ],
+       [   0,    Gamma_p]].
+    """
+    N = Gamma_q.shape[0]
+    Gamma = np.zeros((2*N, 2*N))
+    Gamma[:N, :N]   = Gamma_q
+    Gamma[N:, N:]   = Gamma_p
+    return Gamma
+
+###############################################################################
+# 2) Correlation & partial entropy for a subregion
+###############################################################################
+
+def extract_subregion_covariance_ring(Gamma, site_list):
+    """
+    For a subregion of sites in `site_list` (each < N), we gather
+    *all positions* first, then *all momenta*, so the top-left R x R block
+    in the returned submatrix is position–position.
+
+    R = len(site_list). The final sub-block is (2R x 2R).
+    """
+    N2 = Gamma.shape[0]          # 2*N_total
+    N = N2 // 2                  # total # of sites
+    site_list = np.array(site_list, dtype=int)
+    #if np.any(site_list < 0) or np.any(site_list >= N):
+    for s in range(len(site_list)):
+        if site_list[s]-site_list[0]<0 or site_list[s]-site_list[0]>=N:
+            raise ValueError("Some site index is out of range [0..N-1].")
+
+    # First gather all position dofs { s }, then momentum dofs { s+N }
+    dofs = []
+    for s in site_list:
+        dofs.append(s)
+    for s in site_list:
+        dofs.append(s + N)
+
+    dofs_arr = np.array(dofs, dtype=int)
+    #if np.any(dofs_arr >= 2*N):
+       # raise ValueError("Index out of range in dofs array.")
+    first=dofs_arr[0]
+    for d in range(len(dofs_arr)):
+        dofs_arr[d]=dofs_arr[d]-first
+    return Gamma[np.ix_(dofs_arr, dofs_arr)]
+
+def position_correlation_block(Gamma_sub, site_list, i, j):
+    """
+    Return <x_i x_j> from the sub-cov Gamma_sub.
+
+    Because in extract_subregion_covariance we appended all positions first,
+    the top-left R x R block indeed corresponds to positions of site_list
+    in the same order as site_list. We'll map i-> local row, j-> local col
+    in that top-left block.
+    """
+    # site_map: site -> local_index (0..R-1)
+    site_map = {}
+    for local_idx, s in enumerate(site_list):
+        site_map[s] = local_idx
+
+    if i not in site_map or j not in site_map:
+        print(f"Site {i} or {j} not in sub_sites => correlation=0.")
+        return 0.0
+
+    idx_i = site_map[i]
+    idx_j = site_map[j]
+    # now the top-left R x R block for positions is just row=idx_i, col=idx_j
+    return Gamma_sub[idx_i, idx_j]
+
+def compute_von_neumann_entropy_subregion_ring(Gamma_sub):
+    """
+    Standard formula for the von Neumann entropy of a Gaussian sub-block,
+    must be 2R x 2R dimension.
+    """
+    dim = Gamma_sub.shape[0]
+    if dim % 2 != 0:
+        raise ValueError("dimension not even => no symplectic approach.")
+    R = dim // 2
+
+    # standard symplectic form in 2R dimensions
+    Omega = np.block([
+        [np.zeros((R, R)), np.eye(R)],
+        [-np.eye(R),       np.zeros((R, R))]
+    ])
+    M = -Omega @ Gamma_sub
+    w, _ = la.eig(M)
+    imag_vals = np.sort(np.abs(w.imag))
+    nu = imag_vals[R:]  # largest R are the distinct symplectic eigenvalues
+
+    def f(x):
+        # saturate if x<0.5
+        x_eff = max(x, 0.5)
+        plus  = x_eff + 0.5
+        minus = x_eff - 0.5
+        return plus*np.log2(plus) - minus*np.log2(minus)
+
+    return sum(f(val) for val in nu)
+
+
+
+
+
+
+###############################################################################
 #  1) Build K: A multi-layer radial-lattice potential matrix
 ###############################################################################
 
@@ -305,11 +460,19 @@ U, Gamma_post = post_measurement_momentum_gaussian(Gamma_full, measure_sites, si
 # pick correlation, entropy sites among the boundary
 # e.g. last 2 => correlation, first 2 => entropy
 
+# Find entropy and correlations if there was no bulk:
+K_ring= build_ring_only(len(boundary_sites), k_ring, k_tilde)
+Gq_ring, Gp_ring= ground_state_covariances_ring(K_ring)
+Gamma_full_ring= build_full_covariance_ring(Gq_ring, Gp_ring)
 
-    # compute correlation
 
-    # compute partial entropy
 
+# subGamma_all => entire ring
+subGamma_all_ring= extract_subregion_covariance_ring(Gamma_full_ring, range(len(boundary_sites)))
+
+# e.g. compute correlation <x_10 x_11>
+
+# entropy => e.g. sites [0,1,2]
 
 
 
@@ -319,37 +482,64 @@ corrlist=[]
 corr_distlist=[]
 entropylist=[]
 entropy_distlist=[]
+corr_ring_list=[]
+corr_ring_distlist=[]
+entropy_ring_list=[]
+entropy_ring_distlist=[]
+
 for a in range(int(len(boundary_sites)/2)-1):
     xcorr = position_correlation_sub(Gamma_post, U, boundary_sites[0], boundary_sites[a+1])
     corrlist.append(xcorr)
     corr_distlist.append(boundary_sites[a+1]-boundary_sites[0])
+    xcorr_ring= position_correlation_block(subGamma_all_ring, list(range(len(boundary_sites))), 0, a)
+    corr_ring_list.append(xcorr_ring)
+    corr_ring_distlist.append(boundary_sites[a+1]-boundary_sites[0])
+
+
 
 for a in range(int(len(boundary_sites)/2)-2):
     entropy_sites=boundary_sites[0:a+2]
     subGamma = sub_extract_sites(U, Gamma_post, entropy_sites)
     S_vN= compute_von_neumann_entropy_sub(subGamma)
+    subGamma_ent_ring= extract_subregion_covariance_ring(Gamma_full_ring, entropy_sites)
+    if subGamma_ent_ring.shape[0]%2==0:
+        S_vN_ring= compute_von_neumann_entropy_subregion_ring(subGamma_ent_ring)
+        entropy_ring_list.append(S_vN_ring)
+        entropy_ring_distlist.append(boundary_sites[a+2]-boundary_sites[0])
     if math.isnan(S_vN)==False:
         entropylist.append(S_vN)
-        print(entropy_sites)
-        print(S_vN)
         entropy_distlist.append(boundary_sites[a+2]-boundary_sites[0])
+        
+
+
+
 
 
 plt.subplot(1, 2, 1)
-plt.plot(corr_distlist[1:],corrlist[1:],".")
+plt.plot(corr_distlist[1:],corrlist[1:],".",label="measured bulk")
+plt.plot(corr_ring_distlist[1:],corr_ring_list[1:],".",label="no bulk")
 plt.yscale('log')
 plt.xlabel("Boundary Length")
 plt.ylabel("log(Correlation)")
+plt.legend()
 
 
 plt.subplot(1, 2, 2)
-plt.plot(entropy_distlist[2:],entropylist[2:],".")
+plt.plot(entropy_distlist[2:],entropylist[2:],".",label="measured bulk")
+plt.plot(entropy_ring_distlist[2:],entropy_ring_list[2:],".",label="no bulk")
 #plt.yscale('log')
 plt.xlabel("Boundary Length")
 plt.ylabel("Entropy")
+plt.legend()
 
 plt.tight_layout()
 
 plt.show()
+
+plt.plot(corr_ring_distlist[1:],corr_ring_list[1:],".")
+plt.show()
+
+
+print("entropylist=",entropylist)
 
 print("Finished")
