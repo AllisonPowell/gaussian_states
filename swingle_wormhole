@@ -1,0 +1,143 @@
+% number of layers
+L=7;
+Lh=5;
+% number of sites, 2^(Lh-1) -> ... -> 2^(L-1)
+N=2^(Lh-1)*(2^(L-Lh+1)-1);
+% adjacency matrix
+A=zeros(N,N);
+for l1=Lh:L % start at layer 3 because we exclude lower layers, see below as well
+    for s1=1:2^(l1-1)
+        for l2=Lh:L
+            for s2=1:2^(l2-1)
+                prev1=0;
+                for k1=Lh:l1-1
+                    prev1=prev1+2^(k1-1);
+                end
+                ind1=prev1+s1;
+                prev2=0;
+                for k2=Lh:l2-1
+% 2^(L-1) sites are boundary sites
+bdy_ind=linspace(N-2^(L-1)+1,N,2^(L-1))';
+bdy_theta=linspace(0,2*pi*(1-2^(-(L-1))),2^(L-1))';
+scale=1.3;
+bdy_x=scale*cos(bdy_theta);
+bdy_y=scale*sin(bdy_theta);
+[x_c,y_c]=fruchtermanReingoldLayout_alt(A,bdy_ind,bdy_x,bdy_y);
+%figure()
+%gplot(A, [x_c y_c], '-o');
+% ADD MIDDLE TUBE!!!
+n_tube=3;
+N_tot=2*N+n_tube*2^(Lh-1);
+g_tube=1;
+% make a picture
+z_c_1=[];
+z_c_2=[];
+for l1=Lh:L
+    z_c_1=[z_c_1; .1*(l1-Lh)*ones(2^(l1-1),1)];
+    z_c_2=[z_c_2; -.1*n_tube-.1*(L-Lh+1)+.1*(L-l1)*ones(2^(l1-1),1)];
+end
+figure()
+plot3(x_c,y_c,z_c_1,'k-o',x_c,y_c,z_c_2,'r-x','linewidth',2);
+hold on
+for nn=1:n_tube
+    plot3(x_c(1:2^(Lh-1)),y_c(1:2^(Lh-1)),-.1*nn*ones(2^(Lh-1),1),'b-+');
+end
+hold off
+plot_darkmode
+%figure()
+%%plot3([x_c; x_c],[y_c; y_c],[zeros(length(x_c),1); .2*ones(length(x_c),1)],'ko')
+%%plot3([x_c; x_c],[y_c; y_c],[z_c_1; z_c_2],'ko')
+%plot3(x_c,y_c,z_c_1,'k-o',x_c,y_c,z_c_2,'r-x','linewidth',2);
+bdy_1=linspace(N-2^(L-1)+1,N,2^(L-1))';
+bdy_2=linspace(N_tot-2^(L-1)+1,N_tot,2^(L-1))';
+A_tot=zeros(N_tot,N_tot);
+A_tot(linspace(1,N,N)',linspace(1,N,N)')=A;
+A_tot(N_tot-N+linspace(1,N,N)',N_tot-N+linspace(1,N,N)')=A;
+hor_1=linspace(1,2^(Lh-1),2^(Lh-1))';
+hor_2=N+n_tube*2^(Lh-1)+hor_1;
+for ell1=1:n_tube+1
+    if ell1==1
+        for i1=1:2^(Lh-1)
+            A_tot(hor_1(i1),hor_1(i1)+N)=g_tube;
+            A_tot(hor_1(i1)+N,hor_1(i1))=g_tube;
+        end
+    end
+    if ell1>1
+        for i1=1:2^(Lh-1)
+            A_tot(hor_1(i1)+N+(ell1-2)*2^(Lh-1),hor_1(i1)+N+(ell1-1)*2^(Lh-1))=g_tube;
+            A_tot(hor_1(i1)+N+(ell1-1)*2^(Lh-1),hor_1(i1)+N+(ell1-2)*2^(Lh-1))=g_tube;
+            if i1<2^(Lh-1)
+                A_tot(hor_1(i1)+N+(ell1-2)*2^(Lh-1),hor_1(i1)+N+(ell1-2)*2^(Lh-1)+1)=g_tube;
+                A_tot(hor_1(i1)+N+(ell1-2)*2^(Lh-1)+1,hor_1(i1)+N+(ell1-2)*2^(Lh-1))=g_tube;
+            else
+                % fixed a bug - missing +1 - 5/8
+                A_tot(hor_1(i1)+N+(ell1-2)*2^(Lh-1),hor_1(i1)+N+(ell1-2)*2^(Lh-1)-2^(Lh-1)+1)=g_tube;
+                A_tot(hor_1(i1)+N+(ell1-2)*2^(Lh-1)-2^(Lh-1)+1,hor_1(i1)+N+(ell1-2)*2^(Lh-1))=g_tube;
+            end
+        end
+    end
+end
+D_tot=zeros(N_tot,N_tot);
+for ind1=1:N_tot
+    tmp=sum(A_tot(ind1,:));
+    D_tot(ind1,ind1)=tmp;
+end
+un_set=[bdy_1; bdy_2];
+meas_set=linspace(1,N_tot,N_tot)';
+meas_set=setdiff(meas_set,un_set);
+% initial Gamma
+mu_A=1;
+mu_B=1;
+Gamma_0=zeros(N_tot,N_tot);
+Gamma_0(un_set,un_set)=mu_A*eye(length(un_set));
+Gamma_0(meas_set,meas_set)=mu_B*eye(length(meas_set));
+J=A_tot;
+%J=sqrtm(D_tot-A_tot);
+t=5;
+Gamma=Gamma_0+1i*J*t;
+% post measurement 
+GammaAA=Gamma(un_set,un_set);
+GammaAB=Gamma(un_set,meas_set);
+GammaBA=Gamma(meas_set,un_set);
+GammaBB=Gamma(meas_set,meas_set);
+Gamma_post=GammaAA-GammaAB*mpower(GammaBB,-1)*GammaBA;
+bdy_1_length=2^(L-1);
+bdy_2_length=2^(L-1);
+% the off diagonal terms must not be zero in general
+cov_xx=(1/2)*mpower(real(Gamma_post),-1);
+cov_pp=(1/2)*mpower(real(mpower(Gamma_post,-1)),-1);
+cov_xp_sym=1i*cov_xx*Gamma_post.'-1i*eye(bdy_1_length+bdy_2_length)/2;
+cov_growth_quench=[cov_xx cov_xp_sym; cov_xp_sym.' cov_pp];
+S_1=zeros(bdy_1_length-1,1);
+for r=1:bdy_1_length-1
+    tmp_ind=linspace(1,r,r)';
+    S_1(r)=von_neumann_entropy_alt(extract_subsystem_covariance(cov_growth_quench,tmp_ind));
+end
+S_2=zeros(bdy_2_length-1,1);
+for r=1:bdy_2_length-1
+    tmp_ind=bdy_1_length+linspace(1,r,r)';
+    S_2(r)=von_neumann_entropy_alt(extract_subsystem_covariance(cov_growth_quench,tmp_ind));
+end
+S_1_full=von_neumann_entropy_alt(extract_subsystem_covariance(cov_growth_quench,linspace(1,bdy_1_length,bdy_1_length)'));
+S_12=zeros(bdy_2_length-1,1);
+for r=1:bdy_1_length-1
+    tmp_ind=[linspace(1,r,r)'; bdy_1_length+linspace(1,r,r)'];
+    S_12(r)=von_neumann_entropy_alt(extract_subsystem_covariance(cov_growth_quench,tmp_ind));
+end
+x_bdy=linspace(1,bdy_1_length-1,bdy_1_length-1)';
+figure()
+plot(x_bdy,S_1,'k-',x_bdy,S_12,'r-','linewidth',2); legend('1 side','2 sides')
+plot_darkmode
+% analyzing 2 side entropy
+figure()
+%plot(x_bdy,S_12,'k-',x_bdy,min(min(2*S_1,flipud(2*S_1)),(S_12(floor(bdy_1_length/2))+S_12(1+floor(bdy_1_length/2)))/2),'r-','linewidth',2); legend('2 sides','min(2*(1 side),mid pt of 2 sides)');
+plot(x_bdy,S_12,'k-',x_bdy,min(min(S_1+S_2,flipud(S_1+S_2)),(S_12(floor(bdy_1_length/2))+S_12(1+floor(bdy_1_length/2)))/2),'r-
+','linewidth',2); legend('2 sides','min(2*(1 side),mid pt of 2 sides)');
+plot_darkmode
+% 
+% % analyzing 1 side entropy
+% fudge=.1;
+% S_1_guess=@(x)log(sinh(fudge*pi*x*2^(Lh-L)));
+% fit1=fit(S_1_guess(x_bdy(1:floor(3*bdy_1_length/4))),S_1(1:floor(3*bdy_1_length/4)),'poly1');
+% figure()
+% plot(x_bdy,S_1,'k-',x_bdy,min(fit1(S_1_guess(x_bdy)),S_1_full+fit1(S_1_guess(flipud(x_bdy)))),'r-','linewidth',2); legend('data','holo guess');
