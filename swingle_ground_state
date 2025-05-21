@@ -1,168 +1,101 @@
-# Re-import required libraries due to code state reset
-import numpy as np
-import networkx as nx
-import matplotlib.pyplot as plt
-from scipy.linalg import expm
-
-# Step 1: Recreate layered oscillator graph
-def create_core_layered_graph(num_layers=5, base_sides=4, base_radius=1.0, radial_gap=1.0):
-    G = nx.Graph()
-    pos = {}
-    node_id = 0
-    layer_nodes = []
-
-    for layer in range(num_layers):
-        count = base_sides * (2 ** layer)
-        radius = base_radius + layer * radial_gap
-        rotation = np.pi / count
-        layer_ids = []
-        for i in range(count):
-            theta = 2 * np.pi * i / count + rotation
-            x, y = radius * np.cos(theta), radius * np.sin(theta)
-            G.add_node(node_id)
-            pos[node_id] = (x, y)
-            layer_ids.append(node_id)
-            node_id += 1
-        layer_nodes.append(layer_ids)
-
-    for layer in layer_nodes:
-        for i in range(len(layer)):
-            G.add_edge(layer[i], layer[(i + 1) % len(layer)])
-
-    for inner, outer in zip(layer_nodes[:-1], layer_nodes[1:]):
-        ratio = len(outer) // len(inner)
-        for i, u in enumerate(inner):
-            for j in range(2):
-                v = outer[(ratio * i + j) % len(outer)]
-                G.add_edge(u, v)
-
-    return G, pos, layer_nodes
-
-# Step 2: Initialize graph, indices, and adjacency matrix
-G, pos, layer_nodes = create_core_layered_graph()
-node_list = list(G.nodes)
-index_map = {n: i for i, n in enumerate(node_list)}
-N = len(node_list)
-I = np.eye(N)
-
-# Adjacency matrix
-A = np.zeros((N, N))
-for u, v in G.edges:
-    i, j = index_map[u], index_map[v]
-    A[i, j] = A[j, i] = 1
-
-# Hamiltonian using adjacency matrix
-H_adj = np.block([[A, np.zeros((N, N))],
-                  [np.zeros((N, N)), I]])
-
-# Symplectic matrix
-Omega = np.block([[np.zeros((N, N)), I],
-                  [-I, np.zeros((N, N))]])
-
-# Time evolution parameters
-t = 6
-S_adj = expm(Omega @ H_adj * t)
-Gamma0 = 0.5 * np.eye(2 * N)
-Gamma_adj = S_adj @ Gamma0 @ S_adj.T
-
-# Step 3: Define bulk and boundary
-boundary_nodes = layer_nodes[-1]
-bulk_nodes = [n for n in node_list if n not in boundary_nodes]
-boundary_indices = [index_map[n] for n in boundary_nodes]
-bulk_indices = [index_map[n] for n in bulk_nodes]
-x_idx = np.array(boundary_indices)
-p_idx = x_idx + N
-all_p_idx = np.arange(N, 2 * N)
-bulk_p_idx = np.array(bulk_indices) + N
-keep_idx = np.setdiff1d(np.arange(2 * N), bulk_p_idx)
-Gamma_cond_adj = Gamma_adj[np.ix_(keep_idx, keep_idx)]
-remaining_indices = keep_idx
-index_remap = {old: i for i, old in enumerate(remaining_indices)}
-
-# Step 4: Entropy computation function
-
-def compute_entropy_from_covariance(Gamma):
-    n = Gamma.shape[0] // 2
-    Omega = np.block([
-        [np.zeros((n, n)), np.eye(n)],
-        [-np.eye(n), np.zeros((n, n))]
-    ])
-    sigma = Gamma @ Omega
-    eigvals = np.linalg.eigvals(1j * sigma)
-    nu = np.sort(np.abs(eigvals))[:n]
-    def f(x):
-        x = max(x, 0.500001)
-        #print("nu=",x)
-        #print("log=",(x + 0.5)*np.log(x + 0.5) - (x - 0.5)*np.log(x - 0.5))
-        return (x + 0.5)*np.log(x + 0.5) - (x - 0.5)*np.log(x - 0.5)
-   # print("sum=",sum(f(nu_k) for nu_k in nu))
-    return sum(f(nu_k) for nu_k in nu)
-"""
-def compute_entropy_from_covariance(Gamma):
-    n = Gamma.shape[0] // 2
-    Omega = np.block([
-        [np.zeros((n, n)), np.eye(n)],
-        [-np.eye(n), np.zeros((n, n))]
-    ])
-    sigma = Gamma @ Omega
-    eigvals = np.linalg.eigvals(1j * sigma)
-    nu = np.sort(np.abs(eigvals))[:n]
-
-    # Clamp or discard unphysically large or small eigenvalues
-   # nu = np.clip(nu, 0.500001, 100)  # safe range
-
-    def f(x):
-        return (x + 0.5)*np.log(x + 0.5) - (x - 0.5)*np.log(x - 0.5)
-    
-    return sum(f(nu_k) for nu_k in nu)
-"""
-# Step 5: Compute entropy over growing boundary segments
-entropy_list_adj = []
-lengths_adj = []
-# Re-define boundary_indices safely to ensure it's in scope for averaging code
-
-# Step 1: Rebuild boundary indices from outer layer nodes
-boundary_nodes = layer_nodes[-1]
-boundary_indices = [index_map[n] for n in boundary_nodes]
-boundary_size = len(boundary_indices)
-
-# Apply rotational averaging to smooth out entropy fluctuations
-
-entropy_list_avg = []
-lengths_avg = []
-
-boundary_size = len(boundary_indices)
-
-for L in range(1, boundary_size + 1):
-    entropies_L = []
-
-    # Loop over all possible rotations (start positions)
-    for shift in range(boundary_size):
-        # Build segment of length L starting from index `shift`
-        seg = [boundary_indices[(shift + i) % boundary_size] for i in range(L)]
-        x_sub = [index_remap[i] for i in seg if i in index_remap]
-        p_sub = [index_remap[i + N] for i in seg if (i + N) in index_remap]
-        sub_idx = np.array(x_sub + p_sub)
-        reduced_Gamma = Gamma_cond_adj[np.ix_(sub_idx, sub_idx)]
-        entropy = compute_entropy_from_covariance(reduced_Gamma)
-        entropies_L.append(entropy)
-
-    # Average entropy across all rotations
-    avg_entropy = np.mean(entropies_L)
-    entropy_list_avg.append(avg_entropy)
-    lengths_avg.append(L)
-
-# Symmetrize the entropy list
-N = len(entropy_list_avg)
-entropy_sym = [(entropy_list_avg[i] + entropy_list_avg[N - 1 - i]) / 2 for i in range(N)]
-
-
-# Plot averaged entropy curve
-plt.figure(figsize=(6, 4))
-plt.plot(lengths_avg, entropy_sym, marker='o', color='darkorange')
-plt.xlabel("Boundary Segment Length")
-plt.ylabel("Average Entanglement Entropy")
-plt.title("Rotationally Averaged Entropy After Adjacency Quench")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+% number of layers
+L=7;
+% number of sites, 1 -> 2 -> ... -> 2^(L-1)
+N=2^L-1;
+% exclude layers 1 and 2
+N=N-1-2;
+% adjacency matrix
+A=zeros(N,N);
+for l1=3:L % start at layer 3 because we exclude lower layers, see below as well
+    for s1=1:2^(l1-1)
+        for l2=3:L
+            for s2=1:2^(l2-1)
+                prev1=0;
+                for k1=3:l1-1
+                    prev1=prev1+2^(k1-1);
+                end
+                ind1=prev1+s1;
+                prev2=0;
+                for k2=3:l2-1
+                    prev2=prev2+2^(k2-1);
+                end
+                ind2=prev2+s2;
+                if l1==l2
+                    if abs(s1-s2)==1
+                        A(ind1,ind2)=1;
+                    end
+                    % add pbc
+                    if l1>1
+                        if abs(s1-s2)==2^(l1-1)-1
+                            A(ind1,ind2)=1;
+                        end
+                    end
+                end
+                if l2==l1+1
+                    if s2==2*s1
+                        A(ind1,ind2)=1;
+                    end
+                    if s2==2*s1-1
+                        A(ind1,ind2)=1;
+                    end
+                end
+                if l1==l2+1
+                    if s1==2*s2
+                        A(ind1,ind2)=1;
+                    end
+                    if s1==2*s2-1
+                        A(ind1,ind2)=1;
+                    end
+                end
+                
+            end
+        end
+    end
+end
+D=zeros(N,N);
+for ind1=1:N
+    tmp=sum(A(ind1,:));
+    D(ind1,ind1)=tmp;
+end
+% measured region is all layers less than the last
+meas_set=linspace(1,N-2^(L-1),N-2^(L-1))';
+un_set=linspace(N-2^(L-1)+1,N,2^(L-1))';
+% initial Gamma
+%Gamma_0=eye(N);
+mu_A=1;
+mu_B=1;
+Gamma_0=zeros(N,N);
+Gamma_0(un_set,un_set)=mu_A*eye(length(un_set));
+Gamma_0(meas_set,meas_set)=mu_B*eye(length(meas_set));
+J=A;
+%J=sqrtm(D-A);
+t=32;
+Gamma=Gamma_0+1i*J*t;
+% post measurement 
+GammaAA=Gamma(un_set,un_set);
+GammaAB=Gamma(un_set,meas_set);
+GammaBA=Gamma(meas_set,un_set);
+GammaBB=Gamma(meas_set,meas_set);
+Gamma_post=GammaAA-GammaAB*mpower(GammaBB,-1)*GammaBA;
+bdy_length=2^(L-1);
+% the off diagonal terms must not be zero in general
+%cov_mera_quench=(1/2)*[mpower(real(Gamma_post),-1) zeros(bdy_length,bdy_length); zeros(bdy_length,bdy_length) mpower(real(mpower(Gamma_post,-1)),-1)];
+cov_xx=(1/2)*mpower(real(Gamma_post),-1);
+cov_pp=(1/2)*mpower(real(mpower(Gamma_post,-1)),-1);
+%cov_xp=1i*cov_xx*Gamma_post.';
+%cov_px=(cov_xp).'-1i*eye(bdy_length);
+cov_xp_sym=1i*cov_xx*Gamma_post.'-1i*eye(bdy_length)/2;
+%cov_mera_quench=[cov_xx cov_xp; cov_px cov_pp];
+cov_mera_quench=[cov_xx cov_xp_sym; cov_xp_sym.' cov_pp];
+%norm(cov_mera_quench-cov_mera_quench.')
+S=zeros(bdy_length-1,1);
+for r=1:bdy_length-1
+    tmp_ind=linspace(1,r,r)';
+    S(r)=von_neumann_entropy_alt(extract_subsystem_covariance(cov_mera_quench,tmp_ind));
+end
+x_bdy=linspace(1,bdy_length-1,bdy_length-1)';
+figure()
+f1=fit(log(sin(pi*x_bdy/bdy_length)),S,'poly1');
+plot(x_bdy,S,'ko',x_bdy,f1(log(sin(pi*x_bdy/bdy_length))),'r-','linewidth',2);
+plot_darkmode % new - 5/7
+% evidence for ln(t) scaling of the entanglement
